@@ -1,0 +1,41 @@
+listen: 0.0.0.0:8080
+admin_listen: 0.0.0.0:8081
+
+backends:
+  - id: vllm-0
+    url: http://vllm-0.vllm:8000
+    kv_events:
+      zmq_endpoint: tcp://vllm-0.vllm:5557
+      topic: kv-events
+  - id: sglang-0
+    url: http://sglang-0.sglang:30000
+    kv_events:
+      zmq_endpoint: tcp://sglang-0.sglang:5557
+
+health:
+  path: /health
+  interval: 5s
+  timeout: 2s
+  unhealthy_threshold: 2
+  healthy_threshold: 1
+  passive_failure_threshold: 3
+  ejection_duration: 30s
+
+sessions:
+  header: x-chalk-sticky-session-id
+  generate_if_missing: true
+  ttl: 1h
+  store:
+    kind: redis
+    url: redis://valkey.chalk-statefulrouter:6379
+    key_prefix: "chalk-statefulrouter:"
+
+routing:
+  overlap_weight: 1.0
+  load_weight: 0.5
+  max_retries: 1
+  expose_backend_header: true
+
+kv:
+  enabled: true
+  on_gap: ignore

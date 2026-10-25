@@ -1,0 +1,44 @@
+[package]
+name = "chalk_statefulrouter"
+version = "0.1.0"
+edition = "2021"
+description = "Session- and KV-cache-aware router for LLM inference backends (vLLM, SGLang)"
+publish = false
+
+[lib]
+name = "chalk_statefulrouter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chalk-statefulrouter"
+path = "src/main.rs"
+
+[features]
+default = ["zmq"]
+# Subscribe directly to vLLM / SGLang ZMQ KV event publishers.
+zmq = ["dep:zeromq"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dashmap = "6"
+futures = "0.3"
+humantime-serde = "1"
+parking_lot = "0.12"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "json"] }
+rmpv = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zeromq = { version = "0.4", default-features = false, features = ["tokio-runtime", "tcp-transport"], optional = true }
+
