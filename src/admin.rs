@@ -15,9 +15,10 @@ use serde_json::{json, Value};
 
 use crate::{
     backend::BackendStatus,
-    config::{BackendConfig, KvEventsEndpoint},
+    config::{BackendConfig, KvEventsEndpoint, SessionConfig},
+    inspect::inspect,
     kv::{event::decode_msgpack_batch, KvEventEnvelope},
-    session::valid_session_id,
+    session::derive,
     AppState,
 };
 
@@ -197,23 +198,41 @@ async fn ingest_msgpack(
 }
 
 /// Show how a request would be routed, without forwarding it or touching
-/// session bindings.
+/// session bindings. The body is the inference request itself, or
+/// `{"path": "...", "body": {...}}` to inspect it as a specific API.
 async fn explain(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let session = headers
-        .get(&state.session_header)
-        .and_then(|v| v.to_str().ok())
-        .filter(|id| valid_session_id(id));
     let path = body
         .get("path")
         .and_then(Value::as_str)
-        .unwrap_or("/v1/completions");
+        .unwrap_or("/v1/chat/completions");
     let request = body.get("body").unwrap_or(&body);
-    let tokens = state.tokens.tokens(path, request);
-    match state.router.explain(session, tokens.as_deref()).await {
+    let inspected = inspect(path, request);
+    let config = &state.router.config.sessions;
+    // A minted id would be fresh every call, so explain never generates one.
+    let derive_only = SessionConfig {
+        generate_if_missing: false,
+        ..config.clone()
+    };
+    let session = match derive::resolve(
+        &derive_only,
+        &state.session_header,
+        &headers,
+        Some(request),
+        &inspected,
+    ) {
+        Ok(session) => session,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    let tokens = state.tokens.tokens(&inspected);
+    match state
+        .router
+        .explain(session.as_ref(), tokens.as_deref())
+        .await
+    {
         Ok(explanation) => Json(explanation).into_response(),
         Err(err) => (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
     }
