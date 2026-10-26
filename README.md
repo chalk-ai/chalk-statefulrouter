@@ -32,13 +32,106 @@ including SSE token streams, is passed through as it arrives.
 
 - If a request carries `x-chalk-sticky-session-id`, that header is the session
   key. It must be 1–256 visible ASCII characters, or the router returns 400.
-- If the header is missing and `sessions.generate_if_missing` is set (the
+- If the header is missing, the router tries the `sessions.derive` rules in
+  order (next section).
+- If no rule yields a key and `sessions.generate_if_missing` is set (the
   default), the router mints a UUIDv7.
 - The router forwards the session id to the backend and echoes it on the
-  response, so a client can adopt a minted id for its next turn. It also
-  returns `x-chalk-backend` (the chosen backend's id) unless
-  `routing.expose_backend_header` is false.
+  response, so a client can adopt a minted or derived id for its next turn. It
+  also returns `x-chalk-backend` (the chosen backend's id) and
+  `x-chalk-session-source` (`explicit`, `declared`, `inferred` or
+  `generated`) unless `routing.expose_backend_header` is false.
 - A binding has a sliding TTL (`sessions.ttl`). Every sticky hit refreshes it.
+
+### Session keys from request inspection
+
+Most clients don't send a session header. The router can work out a key from
+the request instead. `src/inspect.rs` parses the prompt out of OpenAI chat
+completions, Anthropic messages, OpenAI responses, completions (text or token
+ids) and SGLang `/generate` bodies. `sessions.derive` then turns the request
+into a key, trying each rule in order:
+
+| rule | key from | source | example |
+|---|---|---|---|
+| `header` | another request header | `declared` | `modal-session-id`, a gateway's conversation header |
+| `body_field` | a JSON pointer into the body | `declared` | `/prompt_cache_key` (the default rule), `/metadata/conversation_id`, `/user` |
+| `prefix` | a hash of a window over the prompt | `inferred` | system prompt through the first user message (the default window) |
+
+Every derived key is hashed (xxh3-128) over length-prefixed fields: the rule,
+the request's `model` (unless `derive_include_model: false`), the vLLM
+`cache_salt`, and the selected bytes. Derived keys therefore can't collide
+with explicit ids or across rules, and the same conversation sent to two
+models is two sessions.
+
+**Why hashing a prefix works.** A multi-turn conversation resends its whole
+history each turn. A window over its opening messages is therefore identical
+on every turn, so every turn hashes to the same key and goes to the backend
+holding its KV cache. Through the store, that holds across replicas too.
+
+**Choosing the window.** A `prefix` rule selects the window with these options:
+
+- **Messages, for chat-shaped requests:**
+  - `skip_roles` drops messages with those roles first.
+  - `skip_messages` then drops that many leading messages.
+  - `user_turns: N` ends the window at the Nth user message. This is the
+    default, with N = 1.
+  - `messages: N` caps the window at N messages.
+- **Characters:** `skip_chars`, `max_chars` and `min_chars` apply to the
+  selected text. For chat, messages are rendered as `role␟content␞`.
+- **Tokens:** `skip_tokens`, `max_tokens` and `min_tokens` apply to token-id
+  prompts.
+
+Two properties matter:
+
+- **Stable.** Turn 1 must already fill the window. If it doesn't, the key
+  changes when later turns extend it. Windows counted in messages are stable
+  by construction, and a request that can't fill one gets no key. For raw text
+  or token prompts, set `min_*` equal to `max_*`.
+- **Distinguishing.** The window must reach past what every session shares.
+  The common "hash the first N tokens" design fails here. When agent sessions
+  share a system prompt longer than N, every session gets the same key and
+  lands on one worker. This is the failure SGLang's
+  [prefix-affinity PR](https://github.com/sgl-project/sglang/pull/31170) and
+  [agent-aware affinity RFC](https://github.com/sgl-project/sglang/issues/34513)
+  document; on a 29K-token shared prefix, `cache_aware` completed only 58 of
+  110 sessions. Ending the window at the first user message always includes
+  what differs, however long the shared system prompt is. Use
+  `skip_roles: [system]` only when you're sure first user messages differ.
+
+**Limits.** Inferred identity is a performance optimization, never an isolation
+boundary:
+
+- Two conversations with identical openings share a session. This is harmless
+  for cache reuse, and bounded load keeps such keys from hot-spotting a backend.
+- Context compaction rewrites the opening, so the conversation starts a new
+  session from that point.
+- Bodies that aren't JSON, or batched prompts, get no inferred key.
+
+### Bounded load (spilling hot sessions)
+
+Pure affinity hot-spots. Modal found this in production with header-hashed
+session routing
+([Kimi K2.6 post](https://modal.com/blog/trillion-tokens-trillion-parameters)):
+uneven hashing, "thicc" sessions fanning out concurrent requests, and uneven
+context sizes. Their fix was to split hot sessions: when a session's replica
+is over a load threshold, send the request elsewhere and keep the affinity
+otherwise.
+
+The router does the same with consistent hashing with bounded loads. A sticky
+backend is skipped for one request when its in-flight requests, counting that
+request, would exceed `ceil(routing.bounded_load.factor × average)` across
+healthy backends:
+
+- The request goes to the best-scoring other backend (`reason: spilled`).
+- The binding doesn't move.
+- All of one session's spilled requests break ties the same way, so the
+  duplicated prefix lands on one second backend.
+
+The default `factor: 1.5` matches SGLang's `prefix_affinity` overload guard;
+Google's bounded-load paper uses 1.25. With N backends, a factor of N or more
+never spills. By default only `inferred` sessions spill (`applies_to`), so an
+explicit `x-chalk-sticky-session-id` keeps its strict guarantee unless you
+opt it in.
 
 ### Multiple frontends sharing one session
 
@@ -117,8 +210,9 @@ score = overlap_weight × (cached prefix tokens / prompt tokens)
 ```
 
 Ties break by rendezvous hash of the session id, so replicas with the same view
-choose the same backend. `POST /route/explain` on the admin port shows the
-scores for a request body without routing it.
+choose the same backend. `POST /route/explain` on the admin port shows, for a
+request body, the derived session key, its binding, whether the request would
+spill, and the scores, without routing it.
 
 **Prompt tokens.** The router matches against the index only when it knows the
 request's exact token ids. Today those come from requests that carry them:
@@ -164,7 +258,7 @@ The proxy listens on `listen` (default `:8080`) and the admin API on
 | `GET` / `DELETE /sessions/{id}` | inspect or drop a binding |
 | `POST /kv-events` | JSON envelope(s): `{"backend","seq"?,"events":[{"type":"block_stored",...}]}` |
 | `POST /kv-events/{backend}` | raw engine msgpack `KVEventBatch` |
-| `POST /route/explain` | scores and current binding for a request body (honors the session header) |
+| `POST /route/explain` | session key (explicit or derived), binding, spill, and scores for a request body; the body is the request itself or `{"path", "body"}` |
 
 ## Testing
 
@@ -193,8 +287,13 @@ publisher in vLLM's wire format.
 - **Shared load signal.** In-flight counts are per replica. Scraping engine
   `/metrics` (`vllm:num_requests_waiting`, `sglang:num_queue_reqs`, KV usage)
   would give every replica the same view.
-- **Spill-over.** Optionally send one request from an overloaded sticky backend
-  elsewhere without rebinding the session.
+- **Learned shared prefixes.** SGLang's agent-aware RFC learns each fleet's
+  shared system prompt from traffic and hashes only what follows it. The
+  `user_turns` window gets the same effect without the learning, but a learned
+  boundary would also cover raw-text prompts.
+- **Session-aware load.** Count in-flight requests per session, not only per
+  backend, so one session fanning out spills before the backend is hot. Modal
+  splits sessions on a per-session threshold.
 - **Discovery.** Watch Kubernetes EndpointSlices instead of static config and
   the admin API.
 - Prometheus metrics: routing reasons, cache-hit ratio, store latency and

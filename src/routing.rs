@@ -8,6 +8,9 @@
 //!    rendezvous hash so replicas with the same view make the same choice.
 //! 3. For a session, the choice is written to the shared store atomically;
 //!    if another replica bound the session first, its choice wins.
+//! 4. Bounded load: a request whose sticky backend is far busier than average
+//!    may spill to the next-best backend, leaving the binding in place (only
+//!    for the session sources `routing.bounded_load.applies_to` lists).
 
 use std::sync::Arc;
 
@@ -18,7 +21,7 @@ use crate::{
     backend::{Backend, BackendId, BackendRegistry},
     config::Config,
     kv::{index::Overlap, KvIndex},
-    session::{SessionStore, StoreError},
+    session::{SessionKey, SessionStore, StoreError},
 };
 
 pub struct Router {
@@ -42,6 +45,9 @@ pub enum Reason {
     Rendezvous,
     /// No session; best-scoring backend.
     Stateless,
+    /// The session's backend was over its bounded-load cap; this request went
+    /// elsewhere and the binding stayed put.
+    Spilled { from: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,10 +60,13 @@ pub struct Score {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Explanation {
-    pub session: Option<String>,
+    pub session: Option<SessionKey>,
     /// Backend the session is bound to (or would map to, in rendezvous mode).
     pub binding: Option<String>,
     pub binding_usable: bool,
+    /// The bound backend is over its bounded-load cap and this session may
+    /// spill, so the request would go to the best-scoring other backend.
+    pub would_spill: bool,
     pub request_tokens: usize,
     /// How a new binding would be chosen, best first.
     pub scores: Vec<Score>,
@@ -81,14 +90,63 @@ impl Router {
     /// request; a session bound to one of them is rebound.
     pub async fn route(
         &self,
-        session: Option<&str>,
+        session: Option<&SessionKey>,
         tokens: Option<&[u32]>,
         exclude: &[BackendId],
     ) -> Result<Decision, RouteError> {
-        let Some(session) = session else {
+        let Some(key) = session else {
             let tiebreak = crate::session::new_session_id();
             return self.best(tokens, exclude, &tiebreak, Reason::Stateless);
         };
+        let decision = self.route_bound(&key.id, tokens, exclude).await?;
+        if !self.should_spill(key, &decision) {
+            return Ok(decision);
+        }
+        // Spilled requests of one session break ties the same way, so they
+        // pile onto one second backend rather than seeding the prefix
+        // everywhere.
+        let mut skip = exclude.to_vec();
+        skip.push(decision.backend.id.clone());
+        let from = decision.backend.id.to_string();
+        Ok(self
+            .best(tokens, &skip, &key.id, Reason::Spilled { from })
+            .unwrap_or(decision))
+    }
+
+    fn should_spill(&self, key: &SessionKey, decision: &Decision) -> bool {
+        let bounded = &self.config.routing.bounded_load;
+        matches!(decision.reason, Reason::Sticky | Reason::Rendezvous)
+            && bounded.applies_to.contains(&key.source)
+            && self.over_load_cap(&decision.backend)
+    }
+
+    /// Consistent hashing with bounded loads: a backend may hold at most
+    /// `ceil(factor × average)` in-flight requests, counting this one.
+    fn over_load_cap(&self, backend: &Backend) -> bool {
+        let Some(factor) = self.config.routing.bounded_load.factor else {
+            return false;
+        };
+        let live: Vec<_> = self
+            .registry
+            .all()
+            .into_iter()
+            .filter(|b| b.accepts_existing())
+            .collect();
+        if live.len() < 2 {
+            return false;
+        }
+        let total: u64 = live.iter().map(|b| b.inflight()).sum();
+        let cap = (factor * (total + 1) as f64 / live.len() as f64).ceil();
+        (backend.inflight() + 1) as f64 > cap
+    }
+
+    /// The session's backend, binding the session if needed.
+    async fn route_bound(
+        &self,
+        session: &str,
+        tokens: Option<&[u32]>,
+        exclude: &[BackendId],
+    ) -> Result<Decision, RouteError> {
         let Some(store) = &self.sessions else {
             return self.rendezvous(session, exclude);
         };
@@ -110,9 +168,10 @@ impl Router {
     /// What [`Router::route`] would consider, without binding anything.
     pub async fn explain(
         &self,
-        session: Option<&str>,
+        key: Option<&SessionKey>,
         tokens: Option<&[u32]>,
     ) -> Result<Explanation, StoreError> {
+        let session = key.map(|k| k.id.as_str());
         let binding = match (session, &self.sessions) {
             (Some(s), Some(store)) => store.get(s, self.config.sessions.ttl).await?,
             (Some(s), None) => self
@@ -121,17 +180,28 @@ impl Router {
                 .map(|d| d.backend.id.to_string()),
             (None, _) => None,
         };
-        let binding_usable = binding
-            .as_deref()
-            .is_some_and(|id| self.usable(id, &[]).is_some());
+        let usable = binding.as_deref().and_then(|id| self.usable(id, &[]));
+        let binding_usable = usable.is_some();
+        let would_spill = match (key, usable) {
+            (Some(key), Some(backend)) => self.should_spill(
+                key,
+                &Decision {
+                    backend,
+                    reason: Reason::Sticky,
+                    scores: Vec::new(),
+                },
+            ),
+            _ => false,
+        };
         let scores = self
             .best(tokens, &[], session.unwrap_or_default(), Reason::Stateless)
             .map(|d| d.scores)
             .unwrap_or_default();
         Ok(Explanation {
-            session: session.map(str::to_string),
+            session: key.cloned(),
             binding,
             binding_usable,
+            would_spill,
             request_tokens: tokens.map_or(0, <[u32]>::len),
             scores,
         })
@@ -295,8 +365,19 @@ mod tests {
     use crate::{
         config::{BackendConfig, GapPolicy, HealthConfig},
         kv::{KvEvent, KvEventEnvelope},
-        session::MemoryStore,
+        session::{MemoryStore, SessionSource},
     };
+
+    fn k(id: &str) -> SessionKey {
+        SessionKey::explicit(id)
+    }
+
+    fn inferred(id: &str) -> SessionKey {
+        SessionKey {
+            id: id.to_string(),
+            source: SessionSource::Inferred,
+        }
+    }
 
     fn router(ids: &[&str], store: Option<Arc<dyn SessionStore>>) -> Router {
         let registry = Arc::new(BackendRegistry::new(ids.iter().map(|id| BackendConfig {
@@ -334,9 +415,9 @@ mod tests {
 
         for i in 0..50 {
             let s = format!("session-{i}");
-            let d1 = r1.route(Some(&s), None, &[]).await.unwrap();
+            let d1 = r1.route(Some(&k(&s)), None, &[]).await.unwrap();
             assert_eq!(d1.reason, Reason::NewSession);
-            let d2 = r2.route(Some(&s), None, &[]).await.unwrap();
+            let d2 = r2.route(Some(&k(&s)), None, &[]).await.unwrap();
             assert_eq!(d2.reason, Reason::Sticky);
             assert_eq!(d1.backend.id, d2.backend.id);
         }
@@ -349,7 +430,7 @@ mod tests {
         let r2 = router(&["a", "b", "c"], Some(store.clone()));
 
         let first = r1
-            .route(Some("s"), None, &[])
+            .route(Some(&k("s")), None, &[])
             .await
             .unwrap()
             .backend
@@ -357,7 +438,7 @@ mod tests {
             .clone();
         kill(&r1, &first);
         kill(&r2, &first);
-        let d1 = r1.route(Some("s"), None, &[]).await.unwrap();
+        let d1 = r1.route(Some(&k("s")), None, &[]).await.unwrap();
         assert_eq!(
             d1.reason,
             Reason::Rebound {
@@ -366,7 +447,7 @@ mod tests {
         );
         assert_ne!(d1.backend.id, first);
         // The other replica sees the new binding instead of rebinding again.
-        let d2 = r2.route(Some("s"), None, &[]).await.unwrap();
+        let d2 = r2.route(Some(&k("s")), None, &[]).await.unwrap();
         assert_eq!(d2.reason, Reason::Sticky);
         assert_eq!(d2.backend.id, d1.backend.id);
     }
@@ -381,7 +462,7 @@ mod tests {
             .bind_if_absent("s", "c", r.config.sessions.ttl)
             .await
             .unwrap();
-        let d = r.route(Some("s"), None, &[]).await.unwrap();
+        let d = r.route(Some(&k("s")), None, &[]).await.unwrap();
         assert_eq!(&*d.backend.id, "c");
     }
 
@@ -390,18 +471,18 @@ mod tests {
         let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
         let r = router(&["a", "b"], Some(store.clone()));
         let first = r
-            .route(Some("s"), None, &[])
+            .route(Some(&k("s")), None, &[])
             .await
             .unwrap()
             .backend
             .id
             .clone();
         let retry = r
-            .route(Some("s"), None, std::slice::from_ref(&first))
+            .route(Some(&k("s")), None, std::slice::from_ref(&first))
             .await
             .unwrap();
         assert_ne!(retry.backend.id, first);
-        let after = r.route(Some("s"), None, &[]).await.unwrap();
+        let after = r.route(Some(&k("s")), None, &[]).await.unwrap();
         assert_eq!(after.backend.id, retry.backend.id);
     }
 
@@ -409,14 +490,17 @@ mod tests {
     async fn draining_keeps_sessions_but_takes_no_new_ones() {
         let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
         let r = router(&["a", "b"], Some(store));
-        let first = r.route(Some("s"), None, &[]).await.unwrap().backend;
+        let first = r.route(Some(&k("s")), None, &[]).await.unwrap().backend;
         first.set_draining(true);
         assert_eq!(
-            r.route(Some("s"), None, &[]).await.unwrap().backend.id,
+            r.route(Some(&k("s")), None, &[]).await.unwrap().backend.id,
             first.id
         );
         for i in 0..20 {
-            let d = r.route(Some(&format!("new-{i}")), None, &[]).await.unwrap();
+            let d = r
+                .route(Some(&k(&format!("new-{i}"))), None, &[])
+                .await
+                .unwrap();
             assert_ne!(d.backend.id, first.id);
         }
     }
@@ -428,14 +512,17 @@ mod tests {
         let mut before = Vec::new();
         for i in 0..100 {
             let s = format!("s{i}");
-            let d1 = r1.route(Some(&s), None, &[]).await.unwrap();
-            let d2 = r2.route(Some(&s), None, &[]).await.unwrap();
+            let d1 = r1.route(Some(&k(&s)), None, &[]).await.unwrap();
+            let d2 = r2.route(Some(&k(&s)), None, &[]).await.unwrap();
             assert_eq!(d1.backend.id, d2.backend.id);
             before.push(d1.backend.id.clone());
         }
         kill(&r1, "a");
         for (i, prev) in before.iter().enumerate() {
-            let d = r1.route(Some(&format!("s{i}")), None, &[]).await.unwrap();
+            let d = r1
+                .route(Some(&k(&format!("s{i}"))), None, &[])
+                .await
+                .unwrap();
             if &**prev != "a" {
                 assert_eq!(
                     &d.backend.id, prev,
@@ -462,7 +549,7 @@ mod tests {
         let tokens = [1, 2, 3, 4, 5];
         for i in 0..10 {
             let d = r
-                .route(Some(&format!("s{i}")), Some(&tokens), &[])
+                .route(Some(&k(&format!("s{i}"))), Some(&tokens), &[])
                 .await
                 .unwrap();
             assert_eq!(&*d.backend.id, "b");
@@ -489,5 +576,73 @@ mod tests {
             r.route(None, None, &[]).await,
             Err(RouteError::NoBackends)
         ));
+    }
+
+    #[tokio::test]
+    async fn hot_inferred_sessions_spill_without_rebinding() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let r = router(&["a", "b", "c"], Some(store.clone()));
+        let home = r
+            .route(Some(&inferred("s")), None, &[])
+            .await
+            .unwrap()
+            .backend;
+
+        // Load the home backend past ceil(1.5 × average).
+        let guards: Vec<_> = (0..4).map(|_| home.inflight_guard()).collect();
+        let d = r.route(Some(&inferred("s")), None, &[]).await.unwrap();
+        assert_eq!(
+            d.reason,
+            Reason::Spilled {
+                from: home.id.to_string()
+            }
+        );
+        assert_ne!(d.backend.id, home.id);
+        // Spilled requests of one session agree on where they go.
+        let again = r.route(Some(&inferred("s")), None, &[]).await.unwrap();
+        assert_eq!(again.backend.id, d.backend.id);
+        // The binding didn't move.
+        let ttl = r.config.sessions.ttl;
+        assert_eq!(
+            store.get("s", ttl).await.unwrap().as_deref(),
+            Some(&*home.id)
+        );
+
+        // Explicit sessions don't spill by default.
+        store.bind_if_absent("x", &home.id, ttl).await.unwrap();
+        let d = r.route(Some(&k("x")), None, &[]).await.unwrap();
+        assert_eq!(
+            (d.reason, d.backend.id.clone()),
+            (Reason::Sticky, home.id.clone())
+        );
+
+        drop(guards);
+        let d = r.route(Some(&inferred("s")), None, &[]).await.unwrap();
+        assert_eq!(
+            (d.reason, d.backend.id.clone()),
+            (Reason::Sticky, home.id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_load_cap() {
+        let mut r = router(&["a", "b"], None);
+        let a = r.registry.get("a").unwrap();
+        // factor 1.5, two backends, `k` in flight on a and none on b: the cap
+        // counting this request is ceil(1.5 × (k + 1) / 2).
+        let mut guards = Vec::new();
+        for k in 0..3 {
+            assert!(!r.over_load_cap(&a), "k={k} fits");
+            guards.push(a.inflight_guard());
+        }
+        // k=3: cap ceil(3.0) = 3, but a would hold 4.
+        assert!(r.over_load_cap(&a));
+        // Load elsewhere raises the average: a=3, b=1 gives cap ceil(3.75) = 4.
+        let _b = r.registry.get("b").unwrap().inflight_guard();
+        assert!(!r.over_load_cap(&a));
+
+        let config = Arc::get_mut(&mut r.config).unwrap();
+        config.routing.bounded_load.factor = None;
+        assert!(!r.over_load_cap(&a));
     }
 }

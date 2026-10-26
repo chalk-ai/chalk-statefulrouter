@@ -10,6 +10,7 @@ pub mod admin;
 pub mod backend;
 pub mod config;
 pub mod health;
+pub mod inspect;
 pub mod kv;
 pub mod proxy;
 pub mod routing;

@@ -14,12 +14,15 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use crate::{
+    inspect::{inspect, InspectedRequest},
     routing::{Reason, RouteError},
-    session::{new_session_id, valid_session_id},
+    session::derive,
     AppState,
 };
 
 pub const BACKEND_HEADER: &str = "x-chalk-backend";
+/// Where the session key came from: explicit, declared, inferred, generated.
+pub const SESSION_SOURCE_HEADER: &str = "x-chalk-session-source";
 
 /// Connection-scoped headers that must not be forwarded, plus ones the client
 /// library recomputes.
@@ -56,24 +59,23 @@ pub async fn proxy(State(state): State<Arc<AppState>>, request: Request) -> Resp
         Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
 
-    let session_header = state.session_header.clone();
-    let session = match parts.headers.get(&session_header) {
-        Some(value) => match value.to_str() {
-            Ok(id) if valid_session_id(id) => Some(id.to_string()),
-            _ => {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid {session_header}: expected 1-256 visible ASCII characters"),
-                )
-            }
-        },
-        None => config.sessions.generate_if_missing.then(new_session_id),
+    let json = serde_json::from_slice::<Value>(&body).ok();
+    let inspected = match &json {
+        Some(json) => inspect(parts.uri.path(), json),
+        None => InspectedRequest::default(),
     };
-
-    let path = parts.uri.path();
-    let tokens = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|json| state.tokens.tokens(path, &json));
+    let session_header = state.session_header.clone();
+    let session = match derive::resolve(
+        &config.sessions,
+        &session_header,
+        &parts.headers,
+        json.as_ref(),
+        &inspected,
+    ) {
+        Ok(session) => session,
+        Err(err) => return error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    let tokens = state.tokens.tokens(&inspected);
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -82,16 +84,19 @@ pub async fn proxy(State(state): State<Arc<AppState>>, request: Request) -> Resp
 
     let mut forward_headers = HeaderMap::new();
     copy_headers(&parts.headers, &mut forward_headers);
-    if let Some(id) = &session {
-        // Validated above, so this can't fail.
-        forward_headers.insert(session_header.clone(), HeaderValue::from_str(id).unwrap());
+    if let Some(key) = &session {
+        // Explicit ids were validated; derived and generated ones are hex.
+        forward_headers.insert(
+            session_header.clone(),
+            HeaderValue::from_str(&key.id).unwrap(),
+        );
     }
 
     let mut exclude = Vec::new();
     for attempt in 0..=config.routing.max_retries {
         let decision = match state
             .router
-            .route(session.as_deref(), tokens.as_deref(), &exclude)
+            .route(session.as_ref(), tokens.as_deref(), &exclude)
             .await
         {
             Ok(decision) => decision,
@@ -143,12 +148,21 @@ pub async fn proxy(State(state): State<Arc<AppState>>, request: Request) -> Resp
 
         let mut response_headers = HeaderMap::new();
         copy_headers(upstream.headers(), &mut response_headers);
-        if let Some(id) = &session {
-            response_headers.insert(session_header.clone(), HeaderValue::from_str(id).unwrap());
+        if let Some(key) = &session {
+            response_headers.insert(
+                session_header.clone(),
+                HeaderValue::from_str(&key.id).unwrap(),
+            );
         }
         if config.routing.expose_backend_header {
             if let Ok(value) = HeaderValue::from_str(&backend.id) {
                 response_headers.insert(BACKEND_HEADER, value);
+            }
+            if let Some(key) = &session {
+                response_headers.insert(
+                    SESSION_SOURCE_HEADER,
+                    HeaderValue::from_static(key.source.as_str()),
+                );
             }
         }
 

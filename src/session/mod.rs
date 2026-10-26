@@ -7,11 +7,13 @@
 //! a binding to a dead backend is moved with compare-and-swap, so replicas
 //! that notice the failure simultaneously still converge on one replacement.
 
+pub mod derive;
 mod memory;
 mod redis;
 
 use std::time::Duration;
 
+pub use derive::{SessionKey, SessionSource};
 pub use memory::MemoryStore;
 pub use redis::RedisStore;
 

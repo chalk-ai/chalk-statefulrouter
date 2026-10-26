@@ -4,6 +4,8 @@ use std::{net::SocketAddr, path::Path, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
+use crate::session::derive::{DeriveRule, SessionSource};
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -44,6 +46,12 @@ impl Config {
             self.health.unhealthy_threshold > 0 && self.health.healthy_threshold > 0,
             "health thresholds must be > 0"
         );
+        for rule in &self.sessions.derive {
+            rule.validate()?;
+        }
+        if let Some(factor) = self.routing.bounded_load.factor {
+            anyhow::ensure!(factor >= 1.0, "bounded_load.factor must be >= 1.0");
+        }
         Ok(())
     }
 }
@@ -142,6 +150,12 @@ pub struct SessionConfig {
     #[serde(with = "humantime_serde")]
     pub ttl: Duration,
     pub store: SessionStoreConfig,
+    /// How to find a session key for requests without the sticky-session
+    /// header, tried in order. See [`crate::session::derive`].
+    pub derive: Vec<DeriveRule>,
+    /// Fold the request's `model` into derived keys, so one conversation
+    /// sent to two models is two sessions (two caches).
+    pub derive_include_model: bool,
 }
 
 impl Default for SessionConfig {
@@ -151,6 +165,11 @@ impl Default for SessionConfig {
             generate_if_missing: true,
             ttl: Duration::from_secs(60 * 60),
             store: SessionStoreConfig::Memory,
+            // OpenAI's own cache-affinity hint; only applies when sent.
+            derive: vec![DeriveRule::BodyField {
+                pointer: "/prompt_cache_key".to_string(),
+            }],
+            derive_include_model: true,
         }
     }
 }
@@ -193,6 +212,34 @@ pub struct RoutingConfig {
     pub max_body_bytes: usize,
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
+    pub bounded_load: BoundedLoadConfig,
+}
+
+/// Lets a request leave its session's backend when that backend is much
+/// busier than average, without moving the session's binding.
+///
+/// Content-inferred sessions need this most: unrelated conversations with
+/// identical openings share a key, and one busy agent session can fan out
+/// many concurrent requests. Breaking affinity for one request costs a
+/// partial prefill elsewhere; queueing behind a hot backend usually costs more.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BoundedLoadConfig {
+    /// A sticky backend is skipped when its in-flight requests (counting this
+    /// one) would exceed `ceil(factor × average)` across healthy backends.
+    /// With N backends a factor >= N never spills. `null` disables spilling.
+    pub factor: Option<f64>,
+    /// Which session sources may spill.
+    pub applies_to: Vec<SessionSource>,
+}
+
+impl Default for BoundedLoadConfig {
+    fn default() -> Self {
+        Self {
+            factor: Some(1.5),
+            applies_to: vec![SessionSource::Inferred],
+        }
+    }
 }
 
 impl Default for RoutingConfig {
@@ -204,6 +251,7 @@ impl Default for RoutingConfig {
             expose_backend_header: true,
             max_body_bytes: 64 * 1024 * 1024,
             connect_timeout: Duration::from_secs(2),
+            bounded_load: BoundedLoadConfig::default(),
         }
     }
 }
@@ -251,6 +299,8 @@ mod tests {
             SessionStoreConfig::Redis { .. }
         ));
         assert_eq!(cfg.health.interval, Duration::from_secs(5));
+        assert_eq!(cfg.sessions.derive.len(), 3);
+        assert_eq!(cfg.routing.bounded_load.factor, Some(1.5));
     }
 
     #[test]

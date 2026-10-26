@@ -604,3 +604,114 @@ async fn subscribes_to_engine_zmq_publisher() {
     }
     panic!("router never indexed blocks published over zmq");
 }
+
+fn chat_turns(conversation: usize, turns: usize) -> Value {
+    let mut messages =
+        vec![json!({"role": "system", "content": "You are a coding agent. ".repeat(500)})];
+    for t in 0..turns {
+        messages.push(
+            json!({"role": "user", "content": format!("conversation {conversation}, turn {t}")}),
+        );
+        messages.push(json!({"role": "assistant", "content": format!("reply {t}")}));
+    }
+    messages.pop();
+    json!({"model": "m", "messages": messages})
+}
+
+#[tokio::test]
+async fn inferred_sessions_follow_conversations_across_replicas() {
+    use chalk_statefulrouter::session::derive::{DeriveRule, PrefixRule};
+
+    let mocks = [
+        MockBackend::start("a").await,
+        MockBackend::start("b").await,
+        MockBackend::start("c").await,
+    ];
+    let mut cfg = config(mocks.iter().map(MockBackend::config).collect(), FAST);
+    cfg.sessions.generate_if_missing = false;
+    cfg.sessions
+        .derive
+        .push(DeriveRule::Prefix(PrefixRule::default()));
+    let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let r1 = start_router(cfg.clone(), Some(store.clone())).await;
+    let r2 = start_router(cfg, Some(store)).await;
+    let all_up = [("a", true), ("b", true), ("c", true)];
+    r1.wait_health(&all_up).await;
+    r2.wait_health(&all_up).await;
+
+    let mut homes = std::collections::HashSet::new();
+    for conversation in 0..20 {
+        let mut home = None;
+        let mut key = None;
+        for turns in 1..=4 {
+            let router = if turns % 2 == 0 { &r1 } else { &r2 };
+            let resp = router
+                .post(
+                    "/v1/chat/completions",
+                    None,
+                    chat_turns(conversation, turns),
+                )
+                .await;
+            assert_eq!(resp.headers()["x-chalk-session-source"], "inferred");
+            let (backend, session, body) = served_by(resp).await;
+            let session = session.unwrap();
+            assert!(session.starts_with("prefix-"));
+            assert_eq!(body["session"], session, "derived key is forwarded");
+            assert_eq!(*key.get_or_insert(session.clone()), session);
+            assert_eq!(*home.get_or_insert(backend.clone()), backend);
+        }
+        homes.insert(home.unwrap());
+    }
+    // The shared 3k-character system prompt must not collapse conversations
+    // onto one backend.
+    assert!(homes.len() > 1, "conversations spread across backends");
+
+    // A client may adopt the derived key as an explicit one.
+    let resp = r1
+        .post("/v1/chat/completions", None, chat_turns(0, 1))
+        .await;
+    let (backend, session, _) = served_by(resp).await;
+    let resp = r2
+        .post(
+            "/v1/completions",
+            session.as_deref(),
+            json!({"prompt": "unrelated"}),
+        )
+        .await;
+    assert_eq!(resp.headers()["x-chalk-session-source"], "explicit");
+    assert_eq!(served_by(resp).await.0, backend);
+}
+
+#[tokio::test]
+async fn prompt_cache_key_is_a_declared_session() {
+    let mocks = [MockBackend::start("a").await, MockBackend::start("b").await];
+    let r = start_router(
+        config(mocks.iter().map(MockBackend::config).collect(), FAST),
+        Some(Arc::new(MemoryStore::new())),
+    )
+    .await;
+    r.wait_health(&[("a", true), ("b", true)]).await;
+
+    let body = |text: &str| json!({"prompt_cache_key": "conv-1", "messages": [{"role": "user", "content": text}]});
+    let resp = r.post("/v1/chat/completions", None, body("first")).await;
+    assert_eq!(resp.headers()["x-chalk-session-source"], "declared");
+    let (home, session, _) = served_by(resp).await;
+    assert!(session.unwrap().starts_with("field-"));
+    for text in ["second", "third"] {
+        let (backend, _, _) =
+            served_by(r.post("/v1/chat/completions", None, body(text)).await).await;
+        assert_eq!(backend, home);
+    }
+
+    let explain: Value = reqwest::Client::new()
+        .post(format!("{}/route/explain", r.admin))
+        .json(&body("x"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(explain["session"]["source"], "declared");
+    assert_eq!(explain["binding"], home);
+}

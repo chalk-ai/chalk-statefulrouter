@@ -29,12 +29,24 @@ sessions:
     kind: redis
     url: redis://valkey.chalk-statefulrouter:6379
     key_prefix: "chalk-statefulrouter:"
+  # Session keys for requests without x-chalk-sticky-session-id; first match wins.
+  derive_include_model: true
+  derive:
+    - kind: header              # a session header another client stack already sends
+      name: modal-session-id
+    - kind: body_field          # OpenAI's cache-affinity hint
+      pointer: /prompt_cache_key
+    - kind: prefix              # infer the conversation from its opening:
+      user_turns: 1             # system prompt(s) through the first user message
 
 routing:
   overlap_weight: 1.0
   load_weight: 0.5
   max_retries: 1
   expose_backend_header: true
+  bounded_load:
+    factor: 1.5                 # spill when a sticky backend exceeds ceil(1.5 x average)
+    applies_to: [inferred]
 
 kv:
   enabled: true
